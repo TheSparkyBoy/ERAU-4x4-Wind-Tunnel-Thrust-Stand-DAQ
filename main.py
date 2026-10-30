@@ -9,15 +9,18 @@ import time
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QComboBox, QPushButton, QTextEdit, QGroupBox,
-    QMessageBox, QInputDialog
+    QMessageBox, QInputDialog, QFrame
 )
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread
+from PyQt6.QtGui import QFont
 
 BAUD = 9600
+TARE_COMMAND = b'*1T\r'  # Default Custom ASCII Tare command for address 1
 
 class LoggerWorker(QObject):
-    """Background worker that manages serial port polling and CSV writing."""
+    """Background worker that manages serial port polling, taring, and CSV writing."""
     message_signal = pyqtSignal(str)
+    reading_signal = pyqtSignal(str, str)  # Emits (sensor_type, reading_value) for live view
     finished_signal = pyqtSignal(str)
 
     def __init__(self, load_port, torque_port, csv_filename):
@@ -35,6 +38,9 @@ class LoggerWorker(QObject):
         }
         self.pending_event_note = ""
         self.start_perf_counter = None
+        
+        # Dictionary to hold active serial port instances for remote commands (like Tare)
+        self.active_serial = {}
 
     def run(self):
         try:
@@ -42,7 +48,7 @@ class LoggerWorker(QObject):
             with open(self.csv_filename, mode='w', newline='') as csv_file:
                 writer = csv.writer(csv_file)
                 
-                # Write header clearly mapping Load Cell and Torque Cell to their COM ports
+                # Write header mapping Load Cell and Torque Cell to their COM ports
                 writer.writerow([
                     "Timestamp", 
                     "Elapsed_us", 
@@ -87,6 +93,10 @@ class LoggerWorker(QObject):
         
         try:
             with serial.Serial(port, baudrate=BAUD, timeout=0.05) as ser:
+                # Register active serial connection for thread-safe command writing (Tare)
+                with self.csv_lock:
+                    self.active_serial[sensor_type] = ser
+
                 while not self.stop_event.is_set():
                     # 1. Send poll command
                     ser.write(b'*1B1\r')
@@ -101,6 +111,9 @@ class LoggerWorker(QObject):
                         line = raw_line.decode('utf-8', errors='ignore').strip()
                         if line:
                             reading = line.replace('->', '').strip()
+                            
+                            # Emit live reading signal to GUI
+                            self.reading_signal.emit(sensor_type, reading)
                             
                             with self.csv_lock:
                                 if self.start_perf_counter is None:
@@ -131,6 +144,24 @@ class LoggerWorker(QObject):
                                 )
         except serial.SerialException as e:
             self.message_signal.emit(f"[{sensor_name} @ {port}] Serial Error: {e}")
+        finally:
+            with self.csv_lock:
+                if sensor_type in self.active_serial:
+                    del self.active_serial[sensor_type]
+
+    def tare_sensor(self, sensor_type):
+        """Sends the tare command to a specific sensor's active serial connection."""
+        with self.csv_lock:
+            ser = self.active_serial.get(sensor_type)
+            sensor_name = "Load Cell" if sensor_type == 'load' else "Torque Cell"
+            if ser and ser.is_open:
+                try:
+                    ser.write(TARE_COMMAND)
+                    self.message_signal.emit(f"*** TARE command sent to {sensor_name} ({ser.port}) ***")
+                except Exception as e:
+                    self.message_signal.emit(f"Error sending tare to {sensor_name}: {e}")
+            else:
+                self.message_signal.emit(f"Warning: Cannot tare {sensor_name} — port is not active.")
 
     def stop(self):
         self.stop_event.set()
@@ -144,7 +175,7 @@ class LoadCellLoggerApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ERAU Prescott - Wind Tunnel Thrust Stand DAQ Tool")
-        self.resize(720, 560)
+        self.resize(780, 650)
 
         self.worker = None
         self.thread = None
@@ -178,33 +209,74 @@ class LoadCellLoggerApp(QMainWindow):
         port_group.setLayout(port_layout)
         main_layout.addWidget(port_group)
 
+        # --- LIVE READINGS DISPLAY GROUP ---
+        live_group = QGroupBox("Live Sensor Readings")
+        live_layout = QHBoxLayout()
+
+        # Load Cell Display Box
+        load_frame = QFrame()
+        load_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        load_frame.setStyleSheet("background-color: #252526; border-radius: 5px;")
+        load_layout_inner = QVBoxLayout(load_frame)
+        load_layout_inner.addWidget(QLabel("Load Cell Live Reading:", alignment=Qt.AlignmentFlag.AlignCenter))
+        self.load_live_label = QLabel("---", alignment=Qt.AlignmentFlag.AlignCenter)
+        self.load_live_label.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
+        self.load_live_label.setStyleSheet("color: #4ec9b0;")
+        load_layout_inner.addWidget(self.load_live_label)
+
+        # Torque Cell Display Box
+        torque_frame = QFrame()
+        torque_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        torque_frame.setStyleSheet("background-color: #252526; border-radius: 5px;")
+        torque_layout_inner = QVBoxLayout(torque_frame)
+        torque_layout_inner.addWidget(QLabel("Torque Cell Live Reading:", alignment=Qt.AlignmentFlag.AlignCenter))
+        self.torque_live_label = QLabel("---", alignment=Qt.AlignmentFlag.AlignCenter)
+        self.torque_live_label.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
+        self.torque_live_label.setStyleSheet("color: #dcdcaa;")
+        torque_layout_inner.addWidget(self.torque_live_label)
+
+        live_layout.addWidget(load_frame)
+        live_layout.addWidget(torque_frame)
+        live_group.setLayout(live_layout)
+        main_layout.addWidget(live_group)
+
         # --- CONTROLS GROUP ---
-        control_group = QGroupBox("Logging Controls")
-        control_layout = QHBoxLayout()
+        control_group = QGroupBox("Logging & Hardware Controls")
+        control_layout = QGridLayout()
 
         self.start_btn = QPushButton("Start Logging")
         self.start_btn.clicked.connect(self.start_logging)
-        control_layout.addWidget(self.start_btn)
+        control_layout.addWidget(self.start_btn, 0, 0)
 
         self.stop_btn = QPushButton("Stop Logging")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_logging)
-        control_layout.addWidget(self.stop_btn)
+        control_layout.addWidget(self.stop_btn, 0, 1)
+
+        self.tare_load_btn = QPushButton("Tare Load Cell")
+        self.tare_load_btn.setEnabled(False)
+        self.tare_load_btn.clicked.connect(lambda: self.tare_sensor('load'))
+        control_layout.addWidget(self.tare_load_btn, 1, 0)
+
+        self.tare_torque_btn = QPushButton("Tare Torque Cell")
+        self.tare_torque_btn.setEnabled(False)
+        self.tare_torque_btn.clicked.connect(lambda: self.tare_sensor('torque'))
+        control_layout.addWidget(self.tare_torque_btn, 1, 1)
 
         self.event_btn = QPushButton("Log Specific Point (Event)")
         self.event_btn.setEnabled(False)
         self.event_btn.clicked.connect(self.log_specific_point)
-        control_layout.addWidget(self.event_btn)
+        control_layout.addWidget(self.event_btn, 2, 0)
 
         quit_btn = QPushButton("Quit Application")
         quit_btn.clicked.connect(self.close)
-        control_layout.addWidget(quit_btn)
+        control_layout.addWidget(quit_btn, 2, 1)
 
         control_group.setLayout(control_layout)
         main_layout.addWidget(control_group)
 
         # --- LIVE LOG OUTPUT ---
-        log_group = QGroupBox("Live Log & Status")
+        log_group = QGroupBox("System Status & Log")
         log_layout = QVBoxLayout()
 
         self.log_text = QTextEdit()
@@ -219,6 +291,13 @@ class LoadCellLoggerApp(QMainWindow):
         """Append messages securely to the text widget."""
         self.log_text.append(message)
 
+    def update_live_reading(self, sensor_type, value):
+        """Updates the live view display labels for load or torque."""
+        if sensor_type == 'load':
+            self.load_live_label.setText(value)
+        elif sensor_type == 'torque':
+            self.torque_live_label.setText(value)
+
     def refresh_ports(self):
         """Scan and populate available system serial COM ports."""
         ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -227,7 +306,6 @@ class LoadCellLoggerApp(QMainWindow):
         self.load_combo.addItems(ports)
         self.torque_combo.addItems(ports)
 
-        # Auto-select defaults if COM5 or COM7 are available
         if 'COM5' in ports:
             self.load_combo.setCurrentText('COM5')
         if 'COM7' in ports:
@@ -258,6 +336,7 @@ class LoadCellLoggerApp(QMainWindow):
         # Connect signals
         self.thread.started.connect(self.worker.run)
         self.worker.message_signal.connect(self.log_message)
+        self.worker.reading_signal.connect(self.update_live_reading)
         self.worker.finished_signal.connect(self.on_logging_finished)
 
         # Update UI state
@@ -266,10 +345,17 @@ class LoadCellLoggerApp(QMainWindow):
         self.load_combo.setEnabled(False)
         self.torque_combo.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.tare_load_btn.setEnabled(True)
+        self.tare_torque_btn.setEnabled(True)
         self.event_btn.setEnabled(True)
 
         self.log_message(f"\n--- Starting Data Acquisition ---")
         self.thread.start()
+
+    def tare_sensor(self, sensor_type):
+        """Trigger tare command on the specific active sensor worker."""
+        if self.is_logging and self.worker:
+            self.worker.tare_sensor(sensor_type)
 
     def log_specific_point(self):
         """Prompt user for a note and mark the current point in data stream."""
@@ -298,7 +384,13 @@ class LoadCellLoggerApp(QMainWindow):
         self.load_combo.setEnabled(True)
         self.torque_combo.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.tare_load_btn.setEnabled(False)
+        self.tare_torque_btn.setEnabled(False)
         self.event_btn.setEnabled(False)
+
+        # Reset live displays
+        self.load_live_label.setText("---")
+        self.torque_live_label.setText("---")
 
         self.log_message(f"Logging stopped. Saved safely to: {filename}\n")
         QMessageBox.information(self, "Complete", f"Logging stopped.\nSaved to: {filename}")

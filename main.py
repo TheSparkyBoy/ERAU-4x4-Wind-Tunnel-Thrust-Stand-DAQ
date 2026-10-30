@@ -1,4 +1,5 @@
 import sys
+import os
 import serial
 import serial.tools.list_ports
 import csv
@@ -9,9 +10,9 @@ import time
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QComboBox, QPushButton, QTextEdit, QGroupBox,
-    QMessageBox, QInputDialog, QFrame
+    QMessageBox, QInputDialog, QFrame, QLineEdit, QFileDialog
 )
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread, QSettings
 from PyQt6.QtGui import QFont
 
 BAUD = 9600
@@ -175,7 +176,10 @@ class LoadCellLoggerApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ERAU Prescott - Wind Tunnel Thrust Stand DAQ Tool")
-        self.resize(780, 650)
+        self.resize(780, 720)
+
+        # Persistent settings manager across sessions
+        self.settings = QSettings("ERAU_Prescott", "ThrustStandDAQ")
 
         self.worker = None
         self.thread = None
@@ -208,6 +212,25 @@ class LoadCellLoggerApp(QMainWindow):
 
         port_group.setLayout(port_layout)
         main_layout.addWidget(port_group)
+
+        # --- DIRECTORY CONFIGURATION GROUP ---
+        dir_group = QGroupBox("Data Storage Directory")
+        dir_layout = QHBoxLayout()
+
+        self.dir_input = QLineEdit()
+        # Load last used directory from settings, or default to a local 'Data' folder
+        last_dir = self.settings.value("last_output_dir", "")
+        if not last_dir:
+            last_dir = os.path.join(os.getcwd(), "Data")
+        self.dir_input.setText(last_dir)
+        dir_layout.addWidget(self.dir_input)
+
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self.browse_directory)
+        dir_layout.addWidget(browse_btn)
+
+        dir_group.setLayout(dir_layout)
+        main_layout.addWidget(dir_group)
 
         # --- LIVE READINGS DISPLAY GROUP ---
         live_group = QGroupBox("Live Sensor Readings")
@@ -298,6 +321,15 @@ class LoadCellLoggerApp(QMainWindow):
         elif sensor_type == 'torque':
             self.torque_live_label.setText(value)
 
+    def browse_directory(self):
+        """Open a folder picker dialog and save selection."""
+        current_dir = self.dir_input.text().strip()
+        dir_name = QFileDialog.getExistingDirectory(self, "Select Output Directory", current_dir)
+        if dir_name:
+            self.dir_input.setText(dir_name)
+            self.settings.setValue("last_output_dir", dir_name)
+            self.log_message(f"Output directory updated: {dir_name}")
+
     def refresh_ports(self):
         """Scan and populate available system serial COM ports."""
         ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -326,7 +358,23 @@ class LoadCellLoggerApp(QMainWindow):
             QMessageBox.warning(self, "Warning", "Load Cell and Torque Cell must be assigned to distinct COM ports.")
             return
 
-        self.csv_filename = f"thrust_stand_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        # Validate output directory
+        output_dir = self.dir_input.text().strip()
+        if not output_dir:
+            QMessageBox.warning(self, "Directory Required", "Please specify an output directory before starting logging.")
+            return
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not create or access directory:\n{e}")
+            return
+
+        # Save latest valid directory to settings
+        self.settings.setValue("last_output_dir", output_dir)
+
+        filename = f"thrust_stand_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.csv_filename = os.path.join(output_dir, filename)
 
         # Setup worker thread and QThread container
         self.thread = QThread()
@@ -344,6 +392,7 @@ class LoadCellLoggerApp(QMainWindow):
         self.start_btn.setEnabled(False)
         self.load_combo.setEnabled(False)
         self.torque_combo.setEnabled(False)
+        self.dir_input.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.tare_load_btn.setEnabled(True)
         self.tare_torque_btn.setEnabled(True)
@@ -383,6 +432,7 @@ class LoadCellLoggerApp(QMainWindow):
         self.start_btn.setEnabled(True)
         self.load_combo.setEnabled(True)
         self.torque_combo.setEnabled(True)
+        self.dir_input.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.tare_load_btn.setEnabled(False)
         self.tare_torque_btn.setEnabled(False)

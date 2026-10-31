@@ -16,40 +16,112 @@ from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread, QSettings
 from PyQt6.QtGui import QFont
 
 BAUD = 9600
-TARE_COMMAND = b'*1T\r'  # Default Custom ASCII Tare command for address 1
+TARE_COMMAND = b'*1T\r'  # Default Custom ASCII command for hardware tare
+
+class LivePreviewWorker(QObject):
+    """Background worker for polling serial ports when LOGGING IS OFF."""
+    preview_reading_signal = pyqtSignal(str, str)  # Emits (sensor_type, display_value)
+    message_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal()
+
+    def __init__(self, load_port, torque_port, get_offset_func):
+        super().__init__()
+        self.load_port = load_port
+        self.torque_port = torque_port
+        self.get_offset_func = get_offset_func
+        self.stop_event = threading.Event()
+
+    def run(self):
+        threads = []
+        if self.load_port:
+            t1 = threading.Thread(target=self.poll_preview, args=(self.load_port, 'load'), daemon=True)
+            threads.append(t1)
+            t1.start()
+        if self.torque_port and self.torque_port != self.load_port:
+            t2 = threading.Thread(target=self.poll_preview, args=(self.torque_port, 'torque'), daemon=True)
+            threads.append(t2)
+            t2.start()
+
+        while not self.stop_event.is_set():
+            time.sleep(0.05)
+
+        for t in threads:
+            t.join(timeout=0.2)
+            
+        self.finished_signal.emit()
+
+    def poll_preview(self, port, sensor_type):
+        try:
+            with serial.Serial(port, baudrate=BAUD, timeout=0.1) as ser:
+                while not self.stop_event.is_set():
+                    ser.write(b'*1B1\r')
+                    raw_line = ser.read_until(b'\r')
+                    if raw_line:
+                        line = raw_line.decode('utf-8', errors='ignore').strip()
+                        if line:
+                            raw_val_str = line.replace('->', '').strip()
+                            try:
+                                raw_val = float(raw_val_str)
+                                offset = self.get_offset_func(sensor_type)
+                                tared_val = raw_val - offset
+                                display_str = f"{tared_val:.3f}"
+                            except ValueError:
+                                display_str = raw_val_str
+
+                            self.preview_reading_signal.emit(sensor_type, display_str)
+                    time.sleep(0.05)  # 20 Hz preview polling rate
+        except Exception:
+            pass  # Suppress serial disconnect errors during preview mode
+
+    def stop(self):
+        self.stop_event.set()
+
 
 class LoggerWorker(QObject):
-    """Background worker that manages serial port polling, taring, and CSV writing."""
+    """Background worker managing high-speed serial polling, CSV writing, event logging, and taring."""
     message_signal = pyqtSignal(str)
-    reading_signal = pyqtSignal(str, str)  # Emits (sensor_type, reading_value) for live view
+    reading_signal = pyqtSignal(str, str)  # Emits (sensor_type, display_value)
     finished_signal = pyqtSignal(str)
 
-    def __init__(self, load_port, torque_port, csv_filename):
+    def __init__(self, load_port, torque_port, csv_filename, event_filename, get_offset_func, update_offset_func):
         super().__init__()
         self.load_port = load_port
         self.torque_port = torque_port
         self.csv_filename = csv_filename
+        self.event_filename = event_filename
+        self.get_offset_func = get_offset_func
+        self.update_offset_func = update_offset_func
+        
         self.stop_event = threading.Event()
         self.csv_lock = threading.Lock()
         
-        # Store latest readings mapped by role
         self.latest_readings = {
             'load': "",
             'torque': ""
         }
+        self.raw_latest = {
+            'load': 0.0,
+            'torque': 0.0
+        }
         self.pending_event_note = ""
         self.start_perf_counter = None
-        
-        # Dictionary to hold active serial port instances for remote commands (like Tare)
         self.active_serial = {}
+        
+        self.event_file = None
+        self.event_writer = None
 
     def run(self):
         try:
             self.message_signal.emit(f"Connecting devices -> Load Cell: {self.load_port} | Torque Cell: {self.torque_port} at {BAUD} baud...")
-            with open(self.csv_filename, mode='w', newline='') as csv_file:
-                writer = csv.writer(csv_file)
+            
+            # Open both main data CSV and separate Events CSV
+            with open(self.csv_filename, mode='w', newline='') as csv_file, \
+                 open(self.event_filename, mode='w', newline='') as self.event_file:
                 
-                # Write header mapping Load Cell and Torque Cell to their COM ports
+                writer = csv.writer(csv_file)
+                self.event_writer = csv.writer(self.event_file)
+                
+                # Write headers
                 writer.writerow([
                     "Timestamp", 
                     "Elapsed_us", 
@@ -58,9 +130,17 @@ class LoggerWorker(QObject):
                     "Event_Note"
                 ])
                 
-                self.message_signal.emit(f"Maximum-speed logging active! Saving stream to {self.csv_filename}")
+                self.event_writer.writerow([
+                    "Timestamp",
+                    "Elapsed_us",
+                    f"Load_Cell ({self.load_port})",
+                    f"Torque_Cell ({self.torque_port})",
+                    "Event_Comment"
+                ])
+                self.event_file.flush()
                 
-                # Start dedicated background threads for each sensor
+                self.message_signal.emit(f"Maximum-speed logging active!\n -> Stream: {self.csv_filename}\n -> Events: {self.event_filename}")
+                
                 t_load = threading.Thread(
                     target=self.log_port, 
                     args=(self.load_port, 'load', writer, csv_file), 
@@ -82,27 +162,25 @@ class LoggerWorker(QObject):
                 t_torque.join(timeout=1.0)
                     
         except Exception as e:
-            self.message_signal.emit(f"Error handling CSV file: {e}")
+            self.message_signal.emit(f"Error handling CSV files: {e}")
+        finally:
+            self.event_file = None
+            self.event_writer = None
         
         self.finished_signal.emit(self.csv_filename)
 
     def log_port(self, port, sensor_type, writer, csv_file):
-        """Worker loop for a single serial port assigned to load or torque cell."""
         counter = 0
         sensor_name = "Load Cell" if sensor_type == 'load' else "Torque Cell"
         self.message_signal.emit(f"[{sensor_name} @ {port}] High-speed logging active...")
         
         try:
             with serial.Serial(port, baudrate=BAUD, timeout=0.05) as ser:
-                # Register active serial connection for thread-safe command writing (Tare)
                 with self.csv_lock:
                     self.active_serial[sensor_type] = ser
 
                 while not self.stop_event.is_set():
-                    # 1. Send poll command
                     ser.write(b'*1B1\r')
-                    
-                    # 2. Read until carriage return terminator
                     raw_line = ser.read_until(b'\r')
                     
                     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
@@ -111,19 +189,27 @@ class LoggerWorker(QObject):
                     if raw_line:
                         line = raw_line.decode('utf-8', errors='ignore').strip()
                         if line:
-                            reading = line.replace('->', '').strip()
+                            raw_val_str = line.replace('->', '').strip()
                             
-                            # Emit live reading signal to GUI
-                            self.reading_signal.emit(sensor_type, reading)
+                            try:
+                                raw_num = float(raw_val_str)
+                                self.raw_latest[sensor_type] = raw_num
+                                offset = self.get_offset_func(sensor_type)
+                                tared_num = raw_num - offset
+                                display_reading = f"{tared_num:.3f}"
+                            except ValueError:
+                                display_reading = raw_val_str
+
+                            # Emit signal for live viewing
+                            self.reading_signal.emit(sensor_type, display_reading)
                             
                             with self.csv_lock:
                                 if self.start_perf_counter is None:
                                     self.start_perf_counter = current_perf
                                 
                                 elapsed_us = int((current_perf - self.start_perf_counter) * 1_000_000)
-                                self.latest_readings[sensor_type] = reading
+                                self.latest_readings[sensor_type] = display_reading
                                 
-                                # Write row once both load and torque cells have reported data
                                 if self.latest_readings['load'] != "" and self.latest_readings['torque'] != "":
                                     event_note = self.pending_event_note
                                     self.pending_event_note = ""
@@ -141,7 +227,7 @@ class LoggerWorker(QObject):
                             counter += 1
                             if counter % 100 == 0:
                                 self.message_signal.emit(
-                                    f"[{sensor_name}] (+{elapsed_us} µs) Reading: {reading} (Count: {counter})"
+                                    f"[{sensor_name}] (+{elapsed_us} µs) Reading: {display_reading} (Count: {counter})"
                                 )
         except serial.SerialException as e:
             self.message_signal.emit(f"[{sensor_name} @ {port}] Serial Error: {e}")
@@ -150,26 +236,52 @@ class LoggerWorker(QObject):
                 if sensor_type in self.active_serial:
                     del self.active_serial[sensor_type]
 
+    def record_event_snapshot(self, note):
+        """Captures a snapshot point and writes it directly to the separate events CSV file."""
+        with self.csv_lock:
+            if not self.event_writer or not self.event_file:
+                return
+            
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+            current_perf = time.perf_counter()
+            elapsed_us = int((current_perf - self.start_perf_counter) * 1_000_000) if self.start_perf_counter else 0
+            
+            load_val = self.latest_readings['load'] if self.latest_readings['load'] != "" else "0.000"
+            torque_val = self.latest_readings['torque'] if self.latest_readings['torque'] != "" else "0.000"
+            comment = note.strip() if note else ""
+            
+            # Write to separate events CSV file
+            self.event_writer.writerow([
+                timestamp,
+                elapsed_us,
+                load_val,
+                torque_val,
+                comment
+            ])
+            self.event_file.flush()
+            
+            # Also attach marker reference for the main stream row
+            self.pending_event_note = f"MARKER: {comment}" if comment else "MARKER"
+
     def tare_sensor(self, sensor_type):
-        """Sends the tare command to a specific sensor's active serial connection."""
+        """Applies software offset tare and sends hardware tare command simultaneously."""
+        sensor_name = "Load Cell" if sensor_type == 'load' else "Torque Cell"
+        
+        current_raw = self.raw_latest[sensor_type]
+        self.update_offset_func(sensor_type, current_raw)
+        self.message_signal.emit(f"*** {sensor_name} Software Tared to 0.000 (Offset: {current_raw:.3f}) ***")
+
         with self.csv_lock:
             ser = self.active_serial.get(sensor_type)
-            sensor_name = "Load Cell" if sensor_type == 'load' else "Torque Cell"
             if ser and ser.is_open:
                 try:
                     ser.write(TARE_COMMAND)
-                    self.message_signal.emit(f"*** TARE command sent to {sensor_name} ({ser.port}) ***")
+                    self.message_signal.emit(f"*** Hardware TARE command sent to {sensor_name} ({ser.port}) ***")
                 except Exception as e:
-                    self.message_signal.emit(f"Error sending tare to {sensor_name}: {e}")
-            else:
-                self.message_signal.emit(f"Warning: Cannot tare {sensor_name} — port is not active.")
+                    self.message_signal.emit(f"Hardware tare note: {e}")
 
     def stop(self):
         self.stop_event.set()
-
-    def add_event_marker(self, note):
-        with self.csv_lock:
-            self.pending_event_note = f"MARKER: {note}" if note.strip() else "MARKER"
 
 
 class LoadCellLoggerApp(QMainWindow):
@@ -178,13 +290,22 @@ class LoadCellLoggerApp(QMainWindow):
         self.setWindowTitle("ERAU Prescott - Wind Tunnel Thrust Stand DAQ Tool")
         self.resize(780, 720)
 
-        # Persistent settings manager across sessions
         self.settings = QSettings("ERAU_Prescott", "ThrustStandDAQ")
+
+        self.offsets = {
+            'load': 0.0,
+            'torque': 0.0
+        }
 
         self.worker = None
         self.thread = None
+        
+        self.preview_worker = None
+        self.preview_thread = None
+        
         self.is_logging = False
         self.csv_filename = None
+        self.event_filename = None
 
         self.init_ui()
         self.refresh_ports()
@@ -200,10 +321,12 @@ class LoadCellLoggerApp(QMainWindow):
 
         port_layout.addWidget(QLabel("Load Cell Port:"), 0, 0)
         self.load_combo = QComboBox()
+        self.load_combo.currentIndexChanged.connect(self.restart_live_preview)
         port_layout.addWidget(self.load_combo, 0, 1)
 
         port_layout.addWidget(QLabel("Torque Cell Port:"), 1, 0)
         self.torque_combo = QComboBox()
+        self.torque_combo.currentIndexChanged.connect(self.restart_live_preview)
         port_layout.addWidget(self.torque_combo, 1, 1)
 
         refresh_btn = QPushButton("Refresh Ports")
@@ -218,7 +341,6 @@ class LoadCellLoggerApp(QMainWindow):
         dir_layout = QHBoxLayout()
 
         self.dir_input = QLineEdit()
-        # Load last used directory from settings, or default to a local 'Data' folder
         last_dir = self.settings.value("last_output_dir", "")
         if not last_dir:
             last_dir = os.path.join(os.getcwd(), "Data")
@@ -236,7 +358,6 @@ class LoadCellLoggerApp(QMainWindow):
         live_group = QGroupBox("Live Sensor Readings")
         live_layout = QHBoxLayout()
 
-        # Load Cell Display Box
         load_frame = QFrame()
         load_frame.setFrameShape(QFrame.Shape.StyledPanel)
         load_frame.setStyleSheet("background-color: #252526; border-radius: 5px;")
@@ -247,7 +368,6 @@ class LoadCellLoggerApp(QMainWindow):
         self.load_live_label.setStyleSheet("color: #4ec9b0;")
         load_layout_inner.addWidget(self.load_live_label)
 
-        # Torque Cell Display Box
         torque_frame = QFrame()
         torque_frame.setFrameShape(QFrame.Shape.StyledPanel)
         torque_frame.setStyleSheet("background-color: #252526; border-radius: 5px;")
@@ -277,12 +397,12 @@ class LoadCellLoggerApp(QMainWindow):
         control_layout.addWidget(self.stop_btn, 0, 1)
 
         self.tare_load_btn = QPushButton("Tare Load Cell")
-        self.tare_load_btn.setEnabled(False)
+        self.tare_load_btn.setEnabled(True)
         self.tare_load_btn.clicked.connect(lambda: self.tare_sensor('load'))
         control_layout.addWidget(self.tare_load_btn, 1, 0)
 
         self.tare_torque_btn = QPushButton("Tare Torque Cell")
-        self.tare_torque_btn.setEnabled(False)
+        self.tare_torque_btn.setEnabled(True)
         self.tare_torque_btn.clicked.connect(lambda: self.tare_sensor('torque'))
         control_layout.addWidget(self.tare_torque_btn, 1, 1)
 
@@ -310,19 +430,22 @@ class LoadCellLoggerApp(QMainWindow):
         log_group.setLayout(log_layout)
         main_layout.addWidget(log_group)
 
+    def get_offset(self, sensor_type):
+        return self.offsets.get(sensor_type, 0.0)
+
+    def update_offset(self, sensor_type, raw_value):
+        self.offsets[sensor_type] = raw_value
+
     def log_message(self, message):
-        """Append messages securely to the text widget."""
         self.log_text.append(message)
 
     def update_live_reading(self, sensor_type, value):
-        """Updates the live view display labels for load or torque."""
         if sensor_type == 'load':
             self.load_live_label.setText(value)
         elif sensor_type == 'torque':
             self.torque_live_label.setText(value)
 
     def browse_directory(self):
-        """Open a folder picker dialog and save selection."""
         current_dir = self.dir_input.text().strip()
         dir_name = QFileDialog.getExistingDirectory(self, "Select Output Directory", current_dir)
         if dir_name:
@@ -331,8 +454,12 @@ class LoadCellLoggerApp(QMainWindow):
             self.log_message(f"Output directory updated: {dir_name}")
 
     def refresh_ports(self):
-        """Scan and populate available system serial COM ports."""
+        self.stop_live_preview()
         ports = [p.device for p in serial.tools.list_ports.comports()]
+        
+        self.load_combo.blockSignals(True)
+        self.torque_combo.blockSignals(True)
+        
         self.load_combo.clear()
         self.torque_combo.clear()
         self.load_combo.addItems(ports)
@@ -345,7 +472,50 @@ class LoadCellLoggerApp(QMainWindow):
         elif len(ports) > 1:
             self.torque_combo.setCurrentIndex(1)
 
+        self.load_combo.blockSignals(False)
+        self.torque_combo.blockSignals(False)
+
         self.log_message(f"Discovered COM ports: {ports}")
+        self.start_live_preview()
+
+    def start_live_preview(self):
+        """Starts preview polling when logging is idle."""
+        if self.is_logging or self.preview_thread is not None:
+            return
+
+        load_port = self.load_combo.currentText()
+        torque_port = self.torque_combo.currentText()
+
+        if not load_port and not torque_port:
+            return
+
+        self.preview_thread = QThread()
+        self.preview_worker = LivePreviewWorker(load_port, torque_port, self.get_offset)
+        self.preview_worker.moveToThread(self.preview_thread)
+
+        self.preview_thread.started.connect(self.preview_worker.run)
+        self.preview_worker.preview_reading_signal.connect(self.update_live_reading)
+        
+        self.preview_worker.finished_signal.connect(self.preview_thread.quit)
+        self.preview_worker.finished_signal.connect(self.preview_worker.deleteLater)
+        self.preview_thread.finished.connect(self.preview_thread.deleteLater)
+
+        self.preview_thread.start()
+
+    def stop_live_preview(self):
+        """Stops preview polling so high-speed logging thread can take over serial ports."""
+        if self.preview_worker:
+            self.preview_worker.stop()
+            if self.preview_thread and self.preview_thread.isRunning():
+                self.preview_thread.quit()
+                self.preview_thread.wait(1000)
+            self.preview_worker = None
+            self.preview_thread = None
+
+    def restart_live_preview(self):
+        if not self.is_logging:
+            self.stop_live_preview()
+            self.start_live_preview()
 
     def start_logging(self):
         load_port = self.load_combo.currentText()
@@ -358,7 +528,6 @@ class LoadCellLoggerApp(QMainWindow):
             QMessageBox.warning(self, "Warning", "Load Cell and Torque Cell must be assigned to distinct COM ports.")
             return
 
-        # Validate output directory
         output_dir = self.dir_input.text().strip()
         if not output_dir:
             QMessageBox.warning(self, "Directory Required", "Please specify an output directory before starting logging.")
@@ -370,52 +539,66 @@ class LoadCellLoggerApp(QMainWindow):
             QMessageBox.critical(self, "Error", f"Could not create or access directory:\n{e}")
             return
 
-        # Save latest valid directory to settings
         self.settings.setValue("last_output_dir", output_dir)
+        self.stop_live_preview()  # Release serial ports from preview worker
 
-        filename = f"thrust_stand_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        self.csv_filename = os.path.join(output_dir, filename)
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.csv_filename = os.path.join(output_dir, f"thrust_stand_data_{timestamp_str}.csv")
+        self.event_filename = os.path.join(output_dir, f"thrust_stand_events_{timestamp_str}.csv")
 
-        # Setup worker thread and QThread container
         self.thread = QThread()
-        self.worker = LoggerWorker(load_port, torque_port, self.csv_filename)
+        self.worker = LoggerWorker(
+            load_port, torque_port, self.csv_filename, self.event_filename,
+            self.get_offset, self.update_offset
+        )
         self.worker.moveToThread(self.thread)
 
-        # Connect signals
         self.thread.started.connect(self.worker.run)
         self.worker.message_signal.connect(self.log_message)
         self.worker.reading_signal.connect(self.update_live_reading)
         self.worker.finished_signal.connect(self.on_logging_finished)
 
-        # Update UI state
+        self.worker.finished_signal.connect(self.thread.quit)
+        self.worker.finished_signal.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+
         self.is_logging = True
         self.start_btn.setEnabled(False)
         self.load_combo.setEnabled(False)
         self.torque_combo.setEnabled(False)
         self.dir_input.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.tare_load_btn.setEnabled(True)
-        self.tare_torque_btn.setEnabled(True)
         self.event_btn.setEnabled(True)
 
-        self.log_message(f"\n--- Starting Data Acquisition ---")
+        self.log_message(f"\n--- Starting High-Speed Data Acquisition ---")
         self.thread.start()
 
     def tare_sensor(self, sensor_type):
-        """Trigger tare command on the specific active sensor worker."""
+        """Tares sensor whether currently logging or idle in preview mode."""
+        sensor_name = "Load Cell" if sensor_type == 'load' else "Torque Cell"
+        
         if self.is_logging and self.worker:
             self.worker.tare_sensor(sensor_type)
+        else:
+            current_disp = self.load_live_label.text() if sensor_type == 'load' else self.torque_live_label.text()
+            try:
+                val = float(current_disp)
+                self.offsets[sensor_type] += val
+                self.log_message(f"*** {sensor_name} Preview Tared to 0.000 ***")
+            except ValueError:
+                self.log_message(f"Could not tare {sensor_name}: invalid numerical reading.")
 
     def log_specific_point(self):
-        """Prompt user for a note and mark the current point in data stream."""
+        """Prompts user for an optional comment and records an event snapshot to the separate events CSV."""
         if not self.is_logging or not self.worker:
             return
 
-        note, ok = QInputDialog.getText(self, "Log Specific Point", "Enter event marker note (optional):")
+        note, ok = QInputDialog.getText(self, "Log Specific Point", "Enter event marker comment (optional):")
         if ok:
-            self.worker.add_event_marker(note)
-            tag = f"MARKER: {note}" if note.strip() else "MARKER"
-            self.log_message(f"*** EVENT MARKER LOGGED: {tag} ***")
+            comment = note.strip()
+            self.worker.record_event_snapshot(comment)
+            display_tag = f"MARKER: {comment}" if comment else "MARKER"
+            self.log_message(f"*** EVENT SNAPSHOT SAVED TO EVENTS CSV: {display_tag} ***")
 
     def stop_logging(self):
         if not self.is_logging or not self.worker:
@@ -423,7 +606,7 @@ class LoadCellLoggerApp(QMainWindow):
 
         self.log_message("\nStopping data acquisition...")
         self.worker.stop()
-        if self.thread:
+        if self.thread and self.thread.isRunning():
             self.thread.quit()
             self.thread.wait(2000)
 
@@ -434,32 +617,18 @@ class LoadCellLoggerApp(QMainWindow):
         self.torque_combo.setEnabled(True)
         self.dir_input.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.tare_load_btn.setEnabled(False)
-        self.tare_torque_btn.setEnabled(False)
         self.event_btn.setEnabled(False)
 
-        # Reset live displays
-        self.load_live_label.setText("---")
-        self.torque_live_label.setText("---")
-
-        self.log_message(f"Logging stopped. Saved safely to: {filename}\n")
-        QMessageBox.information(self, "Complete", f"Logging stopped.\nSaved to: {filename}")
+        self.log_message(f"Logging stopped. Files saved safely:\n -> {filename}\n -> {self.event_filename}\n")
+        QMessageBox.information(self, "Complete", f"Logging stopped.\nData saved successfully.")
+        
+        self.start_live_preview()
 
     def closeEvent(self, event):
-        """Safely clean up threads on application close."""
+        self.stop_live_preview()
         if self.is_logging:
-            reply = QMessageBox.question(
-                self, "Quit", "Logging is currently active. Stop and exit?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self.stop_logging()
-                event.accept()
-            else:
-                event.ignore()
-        else:
-            event.accept()
+            self.stop_logging()
+        event.accept()
 
 
 if __name__ == "__main__":
